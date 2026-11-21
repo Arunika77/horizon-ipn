@@ -1,0 +1,59 @@
+{
+  "ipn.category": "Inventory Profiles Next",
+  "ipn.key.sort": "Sort Inventory / Container",
+  "ipn.key.lock_slot": "Lock / Unlock Hovered Slot",
+  "ipn.key.move_matching": "Move Matching to Container",
+  "ipn.key.dump_all": "Dump Inventory to Container",
+  "ipn.key.pull_matching": "Pull Matching from Container",
+  "ipn.key.pull_all": "Pull All from Container",
+  "ipn.key.apply_profile": "Apply Active Profile",
+  "ipn.key.save_profile": "Save Active Profile",
+  "ipn.key.next_profile": "Cycle Active Profile",
+  "ipn.key.toggle_highlight": "Toggle Matching Slot Highlight",
+  "ipn.key.throw_matching": "Throw Matching Stacks (Hovered)",
+  "ipn.key.throw_all": "Throw All Stacks (Chest / Inv)",
+
+  "ipn.setting.sort_rule": "Sort Order Rule",
+  "ipn.setting.sort_rule.tooltip": "How stacks are ordered when sorting inventory or containers.",
+  "ipn.setting.sort_rule.category": "Category + Name",
+  "ipn.setting.sort_rule.name": "Display Name (A-Z)",
+  "ipn.setting.sort_rule.id": "Item ID (A-Z)",
+  "ipn.setting.sort_rule.count": "Stack Count (High-Low)",
+
+  "ipn.setting.fill_direction": "Sort Fill Direction",
+  "ipn.setting.fill_direction.tooltip": "Arrange sorted stacks row-by-row horizontally or column-by-column vertically.",
+  "ipn.setting.fill_direction.row": "Row by Row",
+  "ipn.setting.fill_direction.col": "Column by Column",
+
+  "ipn.setting.sort_hotbar": "Include Hotbar in Sort",
+  "ipn.setting.sort_hotbar.tooltip": "Also sort unlocked hotbar slots (0-8) when sorting player inventory.",
+
+  "ipn.setting.transfer_hotbar": "Include Hotbar in Transfer / Throw",
+  "ipn.setting.transfer_hotbar.tooltip": "Allow Move Matching, Dump All, and Throw All to include unlocked hotbar slots.",
+
+  "ipn.setting.move_match_mode": "Move Match Behavior",
+  "ipn.setting.move_match_mode.tooltip": "Choose whether Move Match puts matching Item+NBT stacks into empty chest slots or only tops up existing partial chest stacks.",
+  "ipn.setting.move_match_mode.exact": "Match Item + NBT (Allow Empty Slots)",
+  "ipn.setting.move_match_mode.top_up": "Top-Up Existing Stacks Only (No Empty)",
+
+  "ipn.setting.auto_refill": "Auto-Refill Tools & Stacks",
+  "ipn.setting.auto_refill.tooltip": "Replace near-broken tools or depleted stacks in your active hand or offhand from main inventory.",
+
+  "ipn.setting.refill_threshold": "Tool Saver Durability Threshold",
+  "ipn.setting.refill_threshold.tooltip": "Swap a held tool when remaining durability reaches or falls below this value (0 = wait until broken).",
+
+  "ipn.setting.show_buttons": "Show Inventory Side Panel",
+  "ipn.setting.show_buttons.tooltip": "Display Sort, Lock Mode, Container Transfer, and Profile buttons beside inventory/chest screens.",
+
+  "ipn.setting.highlight_matching": "Highlight Matching Slots",
+  "ipn.setting.highlight_matching.tooltip": "Highlight all slots matching the hovered item's ID and NBT across chest and inventory.",
+
+  "ipn.setting.panel_position": "Side Panel Position",
+  "ipn.setting.panel_position.tooltip": "Where the IPN panel docks (or drag the IPN header anytime to move it manually).",
+  "ipn.setting.panel_position.auto": "Left (Auto-dodge)",
+  "ipn.setting.panel_position.left": "Left",
+  "ipn.setting.panel_position.right": "Right (Shift Effects)",
+
+  "ipn.setting.prevent_locked_quickmove": "Protect Locked Slots on Click",
+  "ipn.setting.prevent_locked_quickmove.tooltip": "Block Shift-Click (QuickMove) and Drop (Q) on locked player inventory slots."
+}
