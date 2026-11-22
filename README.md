@@ -10,6 +10,7 @@ Clean-room Rust/WASM inventory management mod for **Horizon** (Minecraft Java 26
   - **Move Match (`M`):** Matches both `ItemKey` and full NBT/Components patch (`match_group`), preventing custom-NBT variants sharing a vanilla ID from filling empty chest slots. Configurable between **`Match Item + NBT (Allow Empty Slots)`** and strict **`Top-Up Existing Stacks Only (No Empty)`** in **Config**.
   - **Dump All (`G`)**, **Pull Match (`U`)**, **Pull All (`Shift+U`)**.
 - **Hover Matching Highlight (`H` / `HL`):** Toggleable cyan highlight across both chest and player inventory matching the hovered item's ID and NBT (aligned with Minecraft's 18x18 slot hover hitbox).
+- **Draggable Container & Inventory Search Bar (`Ctrl+F`):** Search across **Display Name**, **Lore / Tooltip**, and **Item ID** (strips legacy `§` formatting codes and folds small-caps/Unicode server glyphs). Matching slots highlight green with a match counter badge, while non-matching slots dim out. Drag the left grip handle to move the search bar anywhere (right-click grip to reset), right-click the input or click `x` to clear, and optionally enable **Keep Search Across Screens** in **Config** to persist queries across chests.
 - **Bulk Throw Hotkeys:**
   - **Throw Matching (`Shift+Q`):** Throws all stacks matching the hovered slot's Item + NBT on the hovered side (chest or unlocked player inventory).
   - **Throw All (`Ctrl+Shift+Q`):** Throws all container stacks or unlocked player inventory stacks in bounded per-tick click batches (`MAX_CLICKS_PER_TICK = 12`).
@@ -24,6 +25,7 @@ Clean-room Rust/WASM inventory management mod for **Horizon** (Minecraft Java 26
 | Sort Container / Inventory | `R` |
 | Lock / Unlock Hovered Slot | `L` (or `Alt+Left Click`) |
 | Toggle Matching Highlight | `H` (or `HL` button) |
+| Focus Item Search Bar | `Ctrl+F` |
 | Move Matching to Container | `M` |
 | Dump Inventory to Container | `G` |
 | Pull Matching from Container | `U` |

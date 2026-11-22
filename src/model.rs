@@ -171,6 +171,7 @@ pub struct PersistentState {
     pub lock_mode: bool,
     pub active_profile: usize,
     pub custom_offset: Option<[f32; 2]>,
+    pub search_offset: Option<[f32; 2]>,
     pub profiles: Vec<InventoryProfile>,
 }
 
@@ -181,6 +182,7 @@ impl Default for PersistentState {
             lock_mode: false,
             active_profile: 0,
             custom_offset: None,
+            search_offset: None,
             profiles: (0..PROFILE_COUNT)
                 .map(InventoryProfile::default_numbered)
                 .collect(),
@@ -205,6 +207,11 @@ impl PersistentState {
         {
             self.custom_offset = None;
         }
+        if let Some([dx, dy]) = self.search_offset
+            && (!dx.is_finite() || !dy.is_finite())
+        {
+            self.search_offset = None;
+        }
     }
 
     pub fn encode(&self) -> String {
@@ -219,6 +226,12 @@ impl PersistentState {
             && dy.is_finite()
         {
             out.push_str(&format!("custom_offset={dx},{dy}\n"));
+        }
+        if let Some([dx, dy]) = self.search_offset
+            && dx.is_finite()
+            && dy.is_finite()
+        {
+            out.push_str(&format!("search_offset={dx},{dy}\n"));
         }
         for (idx, prof) in self.profiles.iter().enumerate() {
             out.push_str(&format!("profile.{idx}.name={}\n", escape_field(&prof.name)));
@@ -257,12 +270,12 @@ impl PersistentState {
                     state.active_profile = idx;
                 }
             } else if key == "custom_offset" {
-                if let Some((x_s, y_s)) = val.split_once(',')
-                    && let (Ok(dx), Ok(dy)) = (x_s.trim().parse::<f32>(), y_s.trim().parse::<f32>())
-                    && dx.is_finite()
-                    && dy.is_finite()
-                {
-                    state.custom_offset = Some([dx, dy]);
+                if let Some(offset) = parse_offset(val) {
+                    state.custom_offset = Some(offset);
+                }
+            } else if key == "search_offset" {
+                if let Some(offset) = parse_offset(val) {
+                    state.search_offset = Some(offset);
                 }
             } else if let Some(rest) = key.strip_prefix("profile.") {
                 let Some((idx_str, field)) = rest.split_once('.') else {
@@ -341,4 +354,44 @@ fn unescape_field(s: &str) -> String {
         }
     }
     out
+}
+
+fn parse_offset(val: &str) -> Option<[f32; 2]> {
+    let (x_s, y_s) = val.split_once(',')?;
+    let (Ok(dx), Ok(dy)) = (x_s.trim().parse::<f32>(), y_s.trim().parse::<f32>()) else {
+        return None;
+    };
+    (dx.is_finite() && dy.is_finite()).then_some([dx, dy])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PersistentState;
+
+    #[test]
+    fn search_offset_round_trips_and_handles_legacy_or_invalid_values() {
+        let mut state = PersistentState::default();
+        state.custom_offset = Some([-82.0, 4.0]);
+        state.search_offset = Some([12.5, -24.0]);
+        let encoded = state.encode();
+        assert!(encoded.contains("search_offset=12.5,-24\n"));
+
+        let decoded = PersistentState::decode(&encoded);
+        assert_eq!(decoded.custom_offset, Some([-82.0, 4.0]));
+        assert_eq!(decoded.search_offset, Some([12.5, -24.0]));
+
+        // Backward compatibility: state file written without search_offset decodes as None.
+        let legacy = "version=1\nlocked=0,1\nlock_mode=0\nactive_profile=0\n";
+        let decoded_legacy = PersistentState::decode(legacy);
+        assert_eq!(decoded_legacy.search_offset, None);
+
+        // Non-finite values are rejected on decode and normalize.
+        let invalid = PersistentState::decode("version=1\nsearch_offset=NaN,inf\n");
+        assert_eq!(invalid.search_offset, None);
+
+        let mut non_finite = PersistentState::default();
+        non_finite.search_offset = Some([f32::NAN, 10.0]);
+        non_finite.normalize();
+        assert_eq!(non_finite.search_offset, None);
+    }
 }

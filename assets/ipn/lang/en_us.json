@@ -12,6 +12,7 @@
   "ipn.key.toggle_highlight": "Toggle Matching Slot Highlight",
   "ipn.key.throw_matching": "Throw Matching Stacks (Hovered)",
   "ipn.key.throw_all": "Throw All Stacks (Chest / Inv)",
+  "ipn.key.focus_search": "Focus Item Search Bar",
 
   "ipn.setting.sort_rule": "Sort Order Rule",
   "ipn.setting.sort_rule.tooltip": "How stacks are ordered when sorting inventory or containers.",
@@ -55,5 +56,11 @@
   "ipn.setting.panel_position.right": "Right (Shift Effects)",
 
   "ipn.setting.prevent_locked_quickmove": "Protect Locked Slots on Click",
-  "ipn.setting.prevent_locked_quickmove.tooltip": "Block Shift-Click (QuickMove) and Drop (Q) on locked player inventory slots."
+  "ipn.setting.prevent_locked_quickmove.tooltip": "Block Shift-Click (QuickMove) and Drop (Q) on locked player inventory slots.",
+
+  "ipn.setting.show_search_bar": "Show Item Search Bar",
+  "ipn.setting.show_search_bar.tooltip": "Display a draggable item search bar above chest and inventory screens that searches Name, Lore, and Item ID.",
+
+  "ipn.setting.keep_search_query": "Keep Search Across Screens",
+  "ipn.setting.keep_search_query.tooltip": "Keep your search text when closing a chest/inventory so you can search across multiple chests. When OFF, search clears automatically on close."
 }

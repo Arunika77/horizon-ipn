@@ -9,6 +9,7 @@
 
 pub mod model;
 pub mod planner;
+pub mod search;
 
 use crate::model::{
     FillDirection, MoveMatchMode, PROFILE_COUNT, PanelPosition, PersistentState, SlotSnapshot,
@@ -19,11 +20,17 @@ use crate::planner::{
     plan_apply_profile, plan_auto_refill, plan_sort_clicks_bounded, plan_throw_clicks_bounded,
     plan_transfer_clicks_bounded,
 };
+use crate::search::{
+    SEARCH_BAR_H, build_search_bar_layout, build_searchable_haystack, clamp_bar_origin,
+    matches_normalized_query, normalize_search_text, search_bar_width,
+};
+use mod_api::client::widgets::{TextField, WidgetId, Widgets};
 use mod_api::{
-    ClientHost, ClientModifiers, ClientTickPostEvent, ConfigPath, Corner, Flow, Hooks,
-    InputKeyEvent, ItemKey, ItemStack, KeyAction, KeyConflictContext, KeyRegistration, MenuClick,
-    MenuRef, MenuSlotKind, MouseButton, Registrar, RegistrationContext, RenderGuiPostEvent,
-    ScreenExclusionAreasEvent, ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
+    ClientHost, ClientModifiers, ClientTickPostEvent, Components, ConfigPath, Corner, Flow, Hooks,
+    InputKeyEvent, ItemKey, ItemResource, ItemStack, KeyAction, KeyConflictContext,
+    KeyRegistration, MenuClick, MenuRef, MenuSlotKind, MouseButton, Registrar,
+    RegistrationContext, RenderGuiPostEvent, ScreenCharTypedPreEvent, ScreenExclusionAreasEvent,
+    ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent,
     ScreenMouseButtonReleasedPreEvent, ScreenMouseDraggedPreEvent, ScreenRenderForegroundEvent,
     ScreenRenderInventoryMobEffectsEvent, ScreenRenderPostEvent, SettingSpec, SwapWith, Text,
 };
@@ -46,6 +53,7 @@ const KEY_NEXT_PROFILE: &str = "next_profile";
 const KEY_TOGGLE_HIGHLIGHT: &str = "toggle_highlight";
 const KEY_THROW_MATCHING: &str = "throw_matching";
 const KEY_THROW_ALL: &str = "throw_all";
+const KEY_FOCUS_SEARCH: &str = "focus_search";
 
 // Settings keys (registered in Options > Mods > Inventory Profiles Next -> Config).
 const SET_SORT_RULE: &str = "sort_rule";
@@ -59,6 +67,8 @@ const SET_SHOW_BUTTONS: &str = "show_buttons";
 const SET_HIGHLIGHT_MATCHING: &str = "highlight_matching";
 const SET_PANEL_POSITION: &str = "panel_position";
 const SET_PROTECT_LOCKED_CLICKS: &str = "prevent_locked_quickmove";
+const SET_SHOW_SEARCH_BAR: &str = "show_search_bar";
+const SET_KEEP_SEARCH_QUERY: &str = "keep_search_query";
 
 // UI & click-batching limits.
 const PANEL_W: f32 = 76.0;
@@ -156,6 +166,7 @@ struct KeyLabels {
     pull_all: String,
     apply_profile: String,
     save_profile: String,
+    focus_search: String,
 }
 
 impl Default for KeyLabels {
@@ -170,6 +181,7 @@ impl Default for KeyLabels {
             pull_all: "Shift+U".to_owned(),
             apply_profile: "P".to_owned(),
             save_profile: "Shift+P".to_owned(),
+            focus_search: "Ctrl+F".to_owned(),
         }
     }
 }
@@ -184,6 +196,14 @@ struct RuntimeState {
     last_screen_size: [f32; 2],
     last_panel_bounds: Option<[f32; 4]>,
     dragging_panel: Option<[f32; 2]>,
+    search_widgets: Widgets,
+    search_field_id: Option<WidgetId>,
+    dragging_search: Option<[f32; 2]>,
+    last_search_bounds: Option<[f32; 4]>,
+    last_search_matches: usize,
+    was_inventory_open: bool,
+    search_text_cache: HashMap<ItemKey, Vec<(Option<Components>, String)>>,
+    search_text_cache_entries: usize,
     item_meta_cache: HashMap<ItemKey, ItemStaticMeta>,
     cached_settings: ModSettings,
     settings_loaded: bool,
@@ -217,7 +237,60 @@ impl RuntimeState {
             pull_all: key_display(host, KEY_PULL_ALL, "Shift+U"),
             apply_profile: key_display(host, KEY_APPLY_PROFILE, "P"),
             save_profile: key_display(host, KEY_SAVE_PROFILE, "Shift+P"),
+            focus_search: key_display(host, KEY_FOCUS_SEARCH, "Ctrl+F"),
         };
+    }
+
+    fn ensure_search_widget(&mut self) -> WidgetId {
+        if let Some(id) = self.search_field_id {
+            return id;
+        }
+        let mut field = TextField::new([0.0, 0.0, 140.0, 14.0], 64);
+        field.bordered = true;
+        field.message = "Search chest items".to_owned();
+        field.suggestion = Some("Search...".to_owned());
+        let id = self.search_widgets.add_text_field(field);
+        self.search_field_id = Some(id);
+        id
+    }
+
+    fn search_query(&self) -> &str {
+        self.search_field_id
+            .and_then(|id| self.search_widgets.text_field(id))
+            .map_or("", TextField::value)
+    }
+
+    fn is_search_focused(&self) -> bool {
+        self.search_field_id
+            .is_some_and(|id| self.search_widgets.focused() == Some(id))
+    }
+
+    fn sync_search_suggestion(&mut self) {
+        if let Some(id) = self.search_field_id
+            && let Some(field) = self.search_widgets.text_field_mut(id)
+        {
+            field.suggestion = if field.value().is_empty() {
+                Some("Search...".to_owned())
+            } else {
+                None
+            };
+        }
+    }
+
+    fn set_search_query(&mut self, value: &str) {
+        let id = self.ensure_search_widget();
+        if let Some(field) = self.search_widgets.text_field_mut(id) {
+            field.set_value(value);
+        }
+        self.sync_search_suggestion();
+    }
+
+    fn focus_search_select_all(&mut self, host: &dyn ClientHost) {
+        let id = self.ensure_search_widget();
+        self.search_widgets.set_focus(host, Some(id));
+        if let Some(field) = self.search_widgets.text_field_mut(id) {
+            field.edit.select_all();
+        }
     }
 }
 
@@ -275,6 +348,8 @@ impl IpnMod {
             prevent_locked_quickmove: host
                 .setting_bool(SET_PROTECT_LOCKED_CLICKS)
                 .unwrap_or(false),
+            show_search_bar: host.setting_bool(SET_SHOW_SEARCH_BAR).unwrap_or(true),
+            keep_search_query: host.setting_bool(SET_KEEP_SEARCH_QUERY).unwrap_or(false),
         }
     }
 }
@@ -292,6 +367,8 @@ struct ModSettings {
     highlight_matching: bool,
     panel_position: PanelPosition,
     prevent_locked_quickmove: bool,
+    show_search_bar: bool,
+    keep_search_query: bool,
 }
 
 impl Default for ModSettings {
@@ -308,6 +385,8 @@ impl Default for ModSettings {
             highlight_matching: true,
             panel_position: PanelPosition::AutoLeft,
             prevent_locked_quickmove: false,
+            show_search_bar: true,
+            keep_search_query: false,
         }
     }
 }
@@ -825,20 +904,192 @@ fn draw_bordered_rect(draw: &mut dyn mod_api::DrawContext, r: [f32; 4], bg: u32,
     draw.fill([r[0] + r[2] - 1.0, r[1], 1.0, r[3]], border);
 }
 
+fn draw_grip_dots(draw: &mut dyn mod_api::DrawContext, gx: f32, gy: f32, color: u32) {
+    for row in 0..3 {
+        for col in 0..2 {
+            draw.fill(
+                [gx + (col as f32) * 2.0, gy + (row as f32) * 2.0, 1.0, 1.0],
+                color,
+            );
+        }
+    }
+}
+
 /// Draws a cyan match highlight around slots whose item ID and NBT match the hovered stack.
 fn draw_slot_match_overlay(
     draw: &mut dyn mod_api::DrawContext,
     slot_rect: [f32; 4],
     is_hovered: bool,
 ) {
-    let [x, y, w, h] = slot_rect;
     let fill = if is_hovered { 0x1833EEFF } else { 0x3C33EEFF };
-    let border = 0xCC55EEFF;
-    draw.fill([x, y, w, h], fill);
-    draw.fill([x, y, w, 1.0], border);
-    draw.fill([x, y + h - 1.0, w, 1.0], border);
-    draw.fill([x, y, 1.0, h], border);
-    draw.fill([x + w - 1.0, y, 1.0, h], border);
+    draw_bordered_rect(draw, slot_rect, fill, 0xCC55EEFF);
+}
+
+/// Draws a crisp green search highlight around slots matching the active search query.
+fn draw_slot_search_match_overlay(
+    draw: &mut dyn mod_api::DrawContext,
+    slot_rect: [f32; 4],
+    is_hovered: bool,
+) {
+    let fill = if is_hovered { 0x2044FF66 } else { 0x3644FF66 };
+    draw_bordered_rect(draw, slot_rect, fill, 0xEE55FF77);
+}
+
+/// Darkens non-matching slots (heavier on occupied slots, lighter on empty slots).
+fn draw_slot_search_dim_overlay(
+    draw: &mut dyn mod_api::DrawContext,
+    slot_rect: [f32; 4],
+    occupied: bool,
+) {
+    let fill = if occupied { 0xB8000000 } else { 0x60000000 };
+    draw.fill(slot_rect, fill);
+}
+
+fn cached_stack_search_text<'a>(
+    host: &dyn ClientHost,
+    st: &'a mut RuntimeState,
+    stack: &ItemStack,
+) -> &'a str {
+    let key = stack.item();
+    let comps = stack.components();
+    let pos = if let Some(pos) = st
+        .search_text_cache
+        .get(&key)
+        .and_then(|list| list.iter().position(|(c, _)| c.as_ref() == comps))
+    {
+        pos
+    } else {
+        if st.search_text_cache_entries >= 512 {
+            st.search_text_cache.clear();
+            st.search_text_cache_entries = 0;
+        }
+        let (item_id, friendly_name) = {
+            let meta = get_item_meta(host, &mut st.item_meta_cache, key);
+            (meta.id.clone(), meta.default_name.clone())
+        };
+        let hover = host.hover_name(stack);
+        let tooltip = ItemResource::of(stack).tooltip(host, false, false);
+        let haystack = build_searchable_haystack(
+            &item_id,
+            &friendly_name,
+            &hover,
+            tooltip.as_deref(),
+            comps,
+        );
+        let bucket = st.search_text_cache.entry(key).or_default();
+        bucket.push((comps.cloned(), haystack));
+        st.search_text_cache_entries += 1;
+        bucket.len() - 1
+    };
+    &st.search_text_cache[&key][pos].1
+}
+
+fn is_passthrough_nav_or_modifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "key.keyboard.left.shift"
+            | "key.keyboard.right.shift"
+            | "key.keyboard.left.control"
+            | "key.keyboard.right.control"
+            | "key.keyboard.left.alt"
+            | "key.keyboard.right.alt"
+            | "key.keyboard.left.super"
+            | "key.keyboard.right.super"
+            | "key.keyboard.caps.lock"
+            | "key.keyboard.f1"
+            | "key.keyboard.f2"
+            | "key.keyboard.f3"
+            | "key.keyboard.f4"
+            | "key.keyboard.f5"
+            | "key.keyboard.f6"
+            | "key.keyboard.f7"
+            | "key.keyboard.f8"
+            | "key.keyboard.f9"
+            | "key.keyboard.f10"
+            | "key.keyboard.f11"
+            | "key.keyboard.f12"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_search_bar(
+    draw: &mut dyn mod_api::DrawContext,
+    host: &dyn ClientHost,
+    st: &mut RuntimeState,
+    s_layout: &crate::search::SearchBarLayout,
+    mouse: [f32; 2],
+    has_query: bool,
+    match_count: usize,
+    focused: bool,
+    is_dragging: bool,
+) {
+    let border_color = if focused {
+        0xFFFFCC55
+    } else if has_query && match_count > 0 {
+        0xFF55EE88
+    } else if has_query {
+        0xFFFF6666
+    } else {
+        0xFF4F5563
+    };
+    draw_bordered_rect(draw, s_layout.bounds, 0xC414161B, border_color);
+
+    let grip_hovered = point_in_rect(mouse, s_layout.grip_rect);
+    if is_dragging || grip_hovered {
+        draw.fill(s_layout.grip_rect, 0x38FFCC55);
+    }
+    let grip_color = if is_dragging || grip_hovered {
+        0xFFFFCC55
+    } else {
+        0xFF7B8499
+    };
+    draw_grip_dots(
+        draw,
+        s_layout.grip_rect[0] + 3.0,
+        s_layout.grip_rect[1] + 4.0,
+        grip_color,
+    );
+
+    let id = st.ensure_search_widget();
+    if let Some(field) = st.search_widgets.text_field_mut(id) {
+        field.rect = s_layout.field_rect;
+    }
+    st.sync_search_suggestion();
+    let _ = st.search_widgets.draw(draw, host, mouse);
+
+    if let Some(cr) = s_layout.count_rect {
+        draw_bordered_rect(draw, cr, 0xFF1A1E26, 0xFF3E4450);
+        let count_text = format!("{match_count}");
+        let tw = draw.text_width(&count_text);
+        let tx = cr[0] + ((cr[2] - tw) * 0.5).max(1.0);
+        let ty = cr[1] + 3.0;
+        let color = if match_count > 0 {
+            0xFF77FF88
+        } else {
+            0xFFFF7777
+        };
+        draw.text(&count_text, [tx, ty], color, true);
+    }
+
+    let clear_hovered = point_in_rect(mouse, s_layout.clear_rect);
+    let (clear_bg, clear_border, clear_fg) = if has_query {
+        (
+            if clear_hovered {
+                0xFF9E3339
+            } else {
+                0xFF6E2529
+            },
+            0xFFFF7777,
+            0xFFFFFFFF,
+        )
+    } else {
+        (0xFF222630, 0xFF3E4450, 0xFF5C6370)
+    };
+    draw_bordered_rect(draw, s_layout.clear_rect, clear_bg, clear_border);
+    let xw = draw.text_width("x");
+    let xx = s_layout.clear_rect[0] + ((s_layout.clear_rect[2] - xw) * 0.5).max(1.0);
+    let xy = s_layout.clear_rect[1] + 3.0;
+    draw.text("x", [xx, xy], clear_fg, true);
 }
 
 /// Draws a crisp amber outline and tiny 4x5 corner padlock glyph without hiding stack counts.
@@ -1383,6 +1634,18 @@ impl Hooks for IpnMod {
             )
             .tooltip("ipn.setting.prevent_locked_quickmove.tooltip"),
         );
+        let _ = registrar.register_setting(
+            SettingSpec::toggle(SET_SHOW_SEARCH_BAR, "ipn.setting.show_search_bar", true)
+                .tooltip("ipn.setting.show_search_bar.tooltip"),
+        );
+        let _ = registrar.register_setting(
+            SettingSpec::toggle(
+                SET_KEEP_SEARCH_QUERY,
+                "ipn.setting.keep_search_query",
+                false,
+            )
+            .tooltip("ipn.setting.keep_search_query.tooltip"),
+        );
 
         registrar.register_key_mapping(
             KeyRegistration::new(KEY_SORT, "key.keyboard.r")
@@ -1460,6 +1723,13 @@ impl Hooks for IpnMod {
                 .category("ipn.category")
                 .context(KeyConflictContext::Gui),
         );
+        registrar.register_key_mapping(
+            KeyRegistration::new(KEY_FOCUS_SEARCH, "key.keyboard.f")
+                .modifiers(ClientModifiers::new(2))
+                .label("ipn.key.focus_search")
+                .category("ipn.category")
+                .context(KeyConflictContext::Gui),
+        );
     }
 
     fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
@@ -1468,6 +1738,9 @@ impl Hooks for IpnMod {
             .and_then(|p| p.container_menu(host))
             .and_then(|m| m.slot_kinds(host))
             .is_some();
+        let inventory_screen_open = host
+            .observed_screen_id()
+            .is_some_and(|s| s.id == "inventory");
 
         let (prepared_action, save_after, settings) = {
             let mut st = self.state.lock().unwrap();
@@ -1477,6 +1750,24 @@ impl Hooks for IpnMod {
             if st.cache_refresh_ticks >= 20 {
                 st.cache_refresh_ticks = 0;
                 st.refresh_host_caches(host);
+            }
+
+            if inventory_screen_open != st.was_inventory_open {
+                st.refresh_host_caches(host);
+                if !inventory_screen_open {
+                    st.dragging_panel = None;
+                    st.dragging_search = None;
+                    st.search_widgets.set_focus(host, None);
+                    if !st.cached_settings.keep_search_query {
+                        st.set_search_query("");
+                    }
+                }
+                st.was_inventory_open = inventory_screen_open;
+            } else if !inventory_screen_open
+                && !st.cached_settings.keep_search_query
+                && !st.search_query().is_empty()
+            {
+                st.set_search_query("");
             }
 
             if let Some((_, ttl)) = st.toast.as_mut() {
@@ -1496,6 +1787,7 @@ impl Hooks for IpnMod {
 
             if !screen_open {
                 st.dragging_panel = None;
+                st.dragging_search = None;
                 st.pending_throw_target = None;
                 if !matches!(st.pending_action, Some(PendingAction::SaveProfile(_))) {
                     st.pending_action = None;
@@ -1582,7 +1874,23 @@ impl Hooks for IpnMod {
         let mut st = self.state.lock().unwrap();
         self.ensure_loaded(host, &mut st);
         let settings = st.settings(host);
+
+        if settings.show_search_bar {
+            let has_query = !st.search_query().trim().is_empty();
+            let s_layout = build_search_bar_layout(
+                event.screen.rect,
+                st.last_screen_size,
+                st.persistent.search_offset,
+                has_query,
+            );
+            st.last_search_bounds = Some(s_layout.bounds);
+            event.areas.push(s_layout.bounds);
+        } else {
+            st.last_search_bounds = None;
+        }
+
         if !settings.show_buttons {
+            st.last_panel_bounds = None;
             return;
         }
         let panel_h = panel_height(has_storage);
@@ -1675,7 +1983,18 @@ impl Hooks for IpnMod {
         let screen_size = event.draw.size();
         let has_storage = menu_has_storage(event.screen.menu, &kinds);
         let mouse = event.screen.mouse;
-        let (settings, locked_rects, layout_opt, is_dragging, toast_text) = {
+        let (
+            settings,
+            locked_rects,
+            layout_opt,
+            is_dragging,
+            toast_text,
+            search_layout,
+            search_has_query,
+            search_matches,
+            search_focused,
+            is_dragging_search,
+        ) = {
             let mut st = self.state.lock().unwrap();
             self.ensure_loaded(host, &mut st);
             st.last_screen_size = screen_size;
@@ -1718,15 +2037,77 @@ impl Hooks for IpnMod {
 
             let is_dragging = st.dragging_panel.is_some();
             let toast_text = st.toast.as_ref().map(|(s, _)| s.clone());
-            (settings, locked_rects, layout_opt, is_dragging, toast_text)
+
+            let (search_layout, search_has_query, search_matches, search_focused, is_dragging_search) =
+                if settings.show_search_bar {
+                    st.ensure_search_widget();
+                    let norm_query = normalize_search_text(st.search_query());
+                    let has_query = !norm_query.is_empty();
+                    let s_layout = build_search_bar_layout(
+                        event.screen.rect,
+                        screen_size,
+                        st.persistent.search_offset,
+                        has_query,
+                    );
+                    st.last_search_bounds = Some(s_layout.bounds);
+
+                    let mut match_count = 0usize;
+                    if has_query {
+                        for (idx, rect_opt) in boxes.iter().enumerate() {
+                            let Some(rect) = *rect_opt else {
+                                continue;
+                            };
+                            if let Some(stack) = menu.slot(host, idx).flatten() {
+                                let haystack = cached_stack_search_text(host, &mut st, &stack);
+                                if matches_normalized_query(haystack, &norm_query) {
+                                    match_count += 1;
+                                    draw_slot_search_match_overlay(
+                                        &mut *event.draw,
+                                        rect,
+                                        point_in_slot_rect(mouse, rect),
+                                    );
+                                } else {
+                                    draw_slot_search_dim_overlay(&mut *event.draw, rect, true);
+                                }
+                            } else {
+                                draw_slot_search_dim_overlay(&mut *event.draw, rect, false);
+                            }
+                        }
+                    }
+                    st.last_search_matches = match_count;
+                    let focused = st.is_search_focused();
+                    let dragging_s = st.dragging_search.is_some();
+                    (Some(s_layout), has_query, match_count, focused, dragging_s)
+                } else {
+                    st.last_search_bounds = None;
+                    st.last_search_matches = 0;
+                    (None, false, 0, false, false)
+                };
+
+            (
+                settings,
+                locked_rects,
+                layout_opt,
+                is_dragging,
+                toast_text,
+                search_layout,
+                search_has_query,
+                search_matches,
+                search_focused,
+                is_dragging_search,
+            )
         };
 
         // 1. Highlight slots whose Item + NBT matches the hovered item (below tooltips & carried stack).
         let on_panel = layout_opt
             .as_ref()
             .is_some_and(|l| point_in_rect(mouse, l.bounds));
+        let on_search_bar = search_layout
+            .as_ref()
+            .is_some_and(|l| point_in_rect(mouse, l.bounds));
         if settings.highlight_matching
             && !on_panel
+            && !on_search_bar
             && let Some((hovered_idx, target)) = boxes.iter().enumerate().find_map(|(idx, r)| {
                 let rect = (*r)?;
                 point_in_slot_rect(mouse, rect)
@@ -1754,99 +2135,106 @@ impl Hooks for IpnMod {
             draw_slot_lock_overlay(&mut *event.draw, rect);
         }
 
-        let Some(layout) = layout_opt else {
-            return;
-        };
-
         // 3. Render IPN Control Panel & Toast (before tooltips & carried stack so item lore is never occluded).
-        let header_hovered = point_in_rect(mouse, layout.header_rect);
-        draw_bordered_rect(&mut *event.draw, layout.bounds, 0xC414161B, 0xFF4F5563);
-        if is_dragging || header_hovered {
-            event.draw.fill(
-                [
-                    layout.header_rect[0] + 1.0,
-                    layout.header_rect[1] + 1.0,
-                    layout.header_rect[2] - 2.0,
-                    layout.header_rect[3],
-                ],
-                0x38FFCC55,
-            );
-        }
-        event
-            .draw
-            .text(&layout.header_text, layout.header_pos, 0xFFFFCC55, true);
-        let gx = layout.bounds[0] + PANEL_W - 10.0;
-        let gy = layout.bounds[1] + 4.0;
-        let grip_color = if is_dragging || header_hovered {
-            0xFFFFCC55
-        } else {
-            0xFF7B8499
-        };
-        for row in 0..3 {
-            for col in 0..2 {
+        if let Some(layout) = layout_opt {
+            let header_hovered = point_in_rect(mouse, layout.header_rect);
+            draw_bordered_rect(&mut *event.draw, layout.bounds, 0xC414161B, 0xFF4F5563);
+            if is_dragging || header_hovered {
                 event.draw.fill(
-                    [gx + (col as f32) * 2.0, gy + (row as f32) * 2.0, 1.0, 1.0],
-                    grip_color,
+                    [
+                        layout.header_rect[0] + 1.0,
+                        layout.header_rect[1] + 1.0,
+                        layout.header_rect[2] - 2.0,
+                        layout.header_rect[3],
+                    ],
+                    0x38FFCC55,
                 );
+            }
+            event
+                .draw
+                .text(&layout.header_text, layout.header_pos, 0xFFFFCC55, true);
+            let gx = layout.bounds[0] + PANEL_W - 10.0;
+            let gy = layout.bounds[1] + 4.0;
+            let grip_color = if is_dragging || header_hovered {
+                0xFFFFCC55
+            } else {
+                0xFF7B8499
+            };
+            draw_grip_dots(&mut *event.draw, gx, gy, grip_color);
+
+            draw_bordered_rect(
+                &mut *event.draw,
+                layout.profile_badge_rect,
+                0xFF1E222A,
+                0xFF3E4450,
+            );
+            let badge_w = event.draw.text_width(&layout.profile_badge_text);
+            let badge_tx = layout.profile_badge_rect[0]
+                + ((layout.profile_badge_rect[2] - badge_w) * 0.5).max(1.0);
+            event.draw.text(
+                &layout.profile_badge_text,
+                [badge_tx, layout.profile_badge_rect[1] + 2.5],
+                0xFFE6EBF5,
+                true,
+            );
+
+            for btn in &layout.buttons {
+                let hovered = point_in_rect(mouse, btn.rect);
+                let (bg, border, text_color) = if btn.active {
+                    if btn.kind == ButtonKind::ToggleHighlight {
+                        (
+                            if hovered { 0xFF1B7D96 } else { 0xFF146478 },
+                            0xFF55EEFF,
+                            0xFFFFFFFF,
+                        )
+                    } else {
+                        (
+                            if hovered { 0xFFB87414 } else { 0xFF945A0D },
+                            0xFFFFCC55,
+                            0xFFFFFFFF,
+                        )
+                    }
+                } else if hovered {
+                    (0xFF3B4252, 0xFF88C0D0, 0xFFFFFFFF)
+                } else {
+                    (0xFF252A34, 0xFF4B5262, 0xFFDCE2EC)
+                };
+                draw_bordered_rect(&mut *event.draw, btn.rect, bg, border);
+                let tw = event.draw.text_width(&btn.label);
+                let tx = btn.rect[0] + ((btn.rect[2] - tw) * 0.5).max(2.0);
+                let ty = btn.rect[1] + 2.5;
+                event.draw.text(&btn.label, [tx, ty], text_color, true);
+            }
+
+            if let Some(msg) = toast_text {
+                let tw = event.draw.text_width(&msg) + 6.0;
+                let tr = [
+                    layout.bounds[0],
+                    (layout.bounds[1] - 13.0).max(2.0),
+                    tw.max(PANEL_W),
+                    11.0,
+                ];
+                draw_bordered_rect(&mut *event.draw, tr, 0xD8141A22, 0xFF66D9EF);
+                event
+                    .draw
+                    .text(&msg, [tr[0] + 3.0, tr[1] + 1.5], 0xFF9EF0FF, true);
             }
         }
 
-        draw_bordered_rect(
-            &mut *event.draw,
-            layout.profile_badge_rect,
-            0xFF1E222A,
-            0xFF3E4450,
-        );
-        let badge_w = event.draw.text_width(&layout.profile_badge_text);
-        let badge_tx = layout.profile_badge_rect[0]
-            + ((layout.profile_badge_rect[2] - badge_w) * 0.5).max(1.0);
-        event.draw.text(
-            &layout.profile_badge_text,
-            [badge_tx, layout.profile_badge_rect[1] + 2.5],
-            0xFFE6EBF5,
-            true,
-        );
-
-        for btn in &layout.buttons {
-            let hovered = point_in_rect(mouse, btn.rect);
-            let (bg, border, text_color) = if btn.active {
-                if btn.kind == ButtonKind::ToggleHighlight {
-                    (
-                        if hovered { 0xFF1B7D96 } else { 0xFF146478 },
-                        0xFF55EEFF,
-                        0xFFFFFFFF,
-                    )
-                } else {
-                    (
-                        if hovered { 0xFFB87414 } else { 0xFF945A0D },
-                        0xFFFFCC55,
-                        0xFFFFFFFF,
-                    )
-                }
-            } else if hovered {
-                (0xFF3B4252, 0xFF88C0D0, 0xFFFFFFFF)
-            } else {
-                (0xFF252A34, 0xFF4B5262, 0xFFDCE2EC)
-            };
-            draw_bordered_rect(&mut *event.draw, btn.rect, bg, border);
-            let tw = event.draw.text_width(&btn.label);
-            let tx = btn.rect[0] + ((btn.rect[2] - tw) * 0.5).max(2.0);
-            let ty = btn.rect[1] + 2.5;
-            event.draw.text(&btn.label, [tx, ty], text_color, true);
-        }
-
-        if let Some(msg) = toast_text {
-            let tw = event.draw.text_width(&msg) + 6.0;
-            let tr = [
-                layout.bounds[0],
-                (layout.bounds[1] - 13.0).max(2.0),
-                tw.max(PANEL_W),
-                11.0,
-            ];
-            draw_bordered_rect(&mut *event.draw, tr, 0xD8141A22, 0xFF66D9EF);
-            event
-                .draw
-                .text(&msg, [tr[0] + 3.0, tr[1] + 1.5], 0xFF9EF0FF, true);
+        // 4. Render Draggable Search Bar above container (beneath item tooltips & carried stack).
+        if let Some(s_layout) = search_layout {
+            let mut st = self.state.lock().unwrap();
+            draw_search_bar(
+                &mut *event.draw,
+                host,
+                &mut st,
+                &s_layout,
+                mouse,
+                search_has_query,
+                search_matches,
+                search_focused,
+                is_dragging_search,
+            );
         }
     }
 
@@ -1865,80 +2253,129 @@ impl Hooks for IpnMod {
             return;
         };
 
-        // Fast bail-out: only resolve panel hover tooltips when mouse is inside last panel bounds.
+        // Fast bail-out: only resolve hover tooltips when mouse is inside search bar or side panel.
         let tooltip_lines = {
             let st = self.state.lock().unwrap();
-            if !st.cached_settings.show_buttons
-                || st.dragging_panel.is_some()
-                || st
-                    .last_panel_bounds
-                    .is_none_or(|bounds| !point_in_rect(mouse, bounds))
-            {
+            if st.dragging_panel.is_some() || st.dragging_search.is_some() {
                 return;
             }
-            let Some(kinds) = menu.slot_kinds(host) else {
+            let on_search = st.cached_settings.show_search_bar
+                && st
+                    .last_search_bounds
+                    .is_some_and(|bounds| point_in_rect(mouse, bounds));
+            let on_panel = st.cached_settings.show_buttons
+                && st
+                    .last_panel_bounds
+                    .is_some_and(|bounds| point_in_rect(mouse, bounds));
+            if !on_search && !on_panel {
                 return;
-            };
-            let has_storage = menu_has_storage(event.screen.menu, &kinds);
-            let layout = build_panel_layout(
-                &st.cached_keys,
-                event.screen.rect,
-                st.last_screen_size,
-                has_storage,
-                st.cached_settings.panel_position,
-                st.cached_settings.move_match_mode,
-                st.cached_settings.highlight_matching,
-                &st.persistent,
-            );
-            if let Some(btn) = layout.buttons.iter().find(|b| point_in_rect(mouse, b.rect)) {
-                vec![
-                    Text::literal(btn.tooltip_title.clone()),
-                    Text::literal(btn.tooltip_hint.clone()),
-                ]
-            } else if point_in_rect(mouse, layout.profile_badge_rect) {
-                let active_prof = &st.persistent.profiles[st
-                    .persistent
-                    .active_profile
-                    .min(PROFILE_COUNT.saturating_sub(1))];
-                let mut lines = vec![Text::literal(format!(
-                    "Profile {} ({} saved slots)",
-                    active_prof.name,
-                    active_prof.rules.len()
-                ))];
-                if active_prof.rules.is_empty() {
-                    lines.push(Text::literal("Click Save to capture Hotbar/Armor/Offhand"));
-                } else {
-                    for rule in active_prof.rules.iter().take(8) {
-                        let slot_tag = match rule.player_slot {
-                            0..=8 => format!("H{}", rule.player_slot + 1),
-                            36 => "Boots".to_owned(),
-                            37 => "Legs".to_owned(),
-                            38 => "Chest".to_owned(),
-                            39 => "Helm".to_owned(),
-                            40 => "Offhand".to_owned(),
-                            other => format!("S{other}"),
-                        };
-                        let item_label = if rule.preferred_name.is_empty() {
-                            rule.item_id.as_str()
-                        } else {
-                            rule.preferred_name.as_str()
-                        };
-                        lines.push(Text::literal(format!("{slot_tag}: {item_label}")));
-                    }
-                    if active_prof.rules.len() > 8 {
-                        lines.push(Text::literal(format!(
-                            "... +{} more",
-                            active_prof.rules.len() - 8
-                        )));
-                    }
+            }
+
+            let mut search_tip = None;
+            if on_search {
+                let has_query = !st.search_query().trim().is_empty();
+                let s_layout = build_search_bar_layout(
+                    event.screen.rect,
+                    st.last_screen_size,
+                    st.persistent.search_offset,
+                    has_query,
+                );
+                if point_in_rect(mouse, s_layout.grip_rect) {
+                    search_tip = Some(vec![
+                        Text::literal("IPN Item Search"),
+                        Text::literal("Drag to move anywhere"),
+                        Text::literal("Right-click to reset position"),
+                    ]);
+                } else if has_query && point_in_rect(mouse, s_layout.clear_rect) {
+                    search_tip = Some(vec![
+                        Text::literal("Clear Search"),
+                        Text::literal("Tip: Right-click search box to clear"),
+                    ]);
+                } else if s_layout.count_rect.is_some_and(|cr| point_in_rect(mouse, cr)) {
+                    search_tip = Some(vec![
+                        Text::literal(format!("{} matching slot(s)", st.last_search_matches)),
+                        Text::literal("Searches Name, Lore, and Item ID"),
+                    ]);
+                } else if point_in_rect(mouse, s_layout.field_rect)
+                    && !has_query
+                    && !st.is_search_focused()
+                {
+                    search_tip = Some(vec![
+                        Text::literal(format!("Search Items ({})", st.cached_keys.focus_search)),
+                        Text::literal("Matches Name, Lore, and Item ID"),
+                    ]);
                 }
+            }
+
+            if let Some(lines) = search_tip {
                 lines
-            } else if point_in_rect(mouse, layout.header_rect) {
-                vec![
-                    Text::literal("IPN Control Panel"),
-                    Text::literal("Drag header to move anywhere"),
-                    Text::literal("Right-click header to reset position"),
-                ]
+            } else if on_panel {
+                let Some(kinds) = menu.slot_kinds(host) else {
+                    return;
+                };
+                let has_storage = menu_has_storage(event.screen.menu, &kinds);
+                let layout = build_panel_layout(
+                    &st.cached_keys,
+                    event.screen.rect,
+                    st.last_screen_size,
+                    has_storage,
+                    st.cached_settings.panel_position,
+                    st.cached_settings.move_match_mode,
+                    st.cached_settings.highlight_matching,
+                    &st.persistent,
+                );
+                if let Some(btn) = layout.buttons.iter().find(|b| point_in_rect(mouse, b.rect)) {
+                    vec![
+                        Text::literal(btn.tooltip_title.clone()),
+                        Text::literal(btn.tooltip_hint.clone()),
+                    ]
+                } else if point_in_rect(mouse, layout.profile_badge_rect) {
+                    let active_prof = &st.persistent.profiles[st
+                        .persistent
+                        .active_profile
+                        .min(PROFILE_COUNT.saturating_sub(1))];
+                    let mut lines = vec![Text::literal(format!(
+                        "Profile {} ({} saved slots)",
+                        active_prof.name,
+                        active_prof.rules.len()
+                    ))];
+                    if active_prof.rules.is_empty() {
+                        lines.push(Text::literal("Click Save to capture Hotbar/Armor/Offhand"));
+                    } else {
+                        for rule in active_prof.rules.iter().take(8) {
+                            let slot_tag = match rule.player_slot {
+                                0..=8 => format!("H{}", rule.player_slot + 1),
+                                36 => "Boots".to_owned(),
+                                37 => "Legs".to_owned(),
+                                38 => "Chest".to_owned(),
+                                39 => "Helm".to_owned(),
+                                40 => "Offhand".to_owned(),
+                                other => format!("S{other}"),
+                            };
+                            let item_label = if rule.preferred_name.is_empty() {
+                                rule.item_id.as_str()
+                            } else {
+                                rule.preferred_name.as_str()
+                            };
+                            lines.push(Text::literal(format!("{slot_tag}: {item_label}")));
+                        }
+                        if active_prof.rules.len() > 8 {
+                            lines.push(Text::literal(format!(
+                                "... +{} more",
+                                active_prof.rules.len() - 8
+                            )));
+                        }
+                    }
+                    lines
+                } else if point_in_rect(mouse, layout.header_rect) {
+                    vec![
+                        Text::literal("IPN Control Panel"),
+                        Text::literal("Drag header to move anywhere"),
+                        Text::literal("Right-click header to reset position"),
+                    ]
+                } else {
+                    return;
+                }
             } else {
                 return;
             }
@@ -1974,11 +2411,67 @@ impl Hooks for IpnMod {
         let alt_held = (event.modifiers & 4) != 0;
         let shift_held = (event.modifiers & 1) != 0;
 
-        // 1. Check clicks & header drag on the IPN side panel first.
+        // 0. Check clicks & drag handle on the Item Search Bar first.
         {
             let mut st = self.state.lock().unwrap();
             self.ensure_loaded(host, &mut st);
-            if st.cached_settings.show_buttons {
+            st.cached_settings = settings;
+            if settings.show_search_bar {
+                let has_query = !st.search_query().trim().is_empty();
+                let s_layout = build_search_bar_layout(
+                    event.screen.rect,
+                    st.last_screen_size,
+                    st.persistent.search_offset,
+                    has_query,
+                );
+                st.last_search_bounds = Some(s_layout.bounds);
+                if point_in_rect(mouse, s_layout.grip_rect) {
+                    if event.button == 0 {
+                        st.dragging_search =
+                            Some([mouse[0] - s_layout.bounds[0], mouse[1] - s_layout.bounds[1]]);
+                        st.search_widgets.set_focus(host, None);
+                    } else if event.button == 1 {
+                        st.persistent.search_offset = None;
+                        st.dragging_search = None;
+                        self.save_persistent(host, &st.persistent);
+                        st.set_toast("Search bar position reset");
+                    }
+                    return Flow::Cancel;
+                }
+                if has_query && event.button == 0 && point_in_rect(mouse, s_layout.clear_rect) {
+                    st.set_search_query("");
+                    return Flow::Cancel;
+                }
+                if point_in_rect(mouse, s_layout.field_rect) {
+                    let id = st.ensure_search_widget();
+                    if let Some(field) = st.search_widgets.text_field_mut(id) {
+                        field.rect = s_layout.field_rect;
+                    }
+                    if event.button == 1 {
+                        st.set_search_query("");
+                        st.search_widgets.set_focus(host, Some(id));
+                    } else if event.button == 0 {
+                        let _ = st
+                            .search_widgets
+                            .mouse_pressed(host, mouse, event.button, event.modifiers);
+                        st.sync_search_suggestion();
+                    }
+                    return Flow::Cancel;
+                }
+                if point_in_rect(mouse, s_layout.bounds) {
+                    return Flow::Cancel;
+                }
+            }
+            if st.is_search_focused() {
+                st.search_widgets.set_focus(host, None);
+            }
+        }
+
+        // 1. Check clicks & header drag on the IPN side panel.
+        {
+            let mut st = self.state.lock().unwrap();
+            self.ensure_loaded(host, &mut st);
+            if settings.show_buttons {
                 let layout = build_panel_layout(
                     &st.cached_keys,
                     event.screen.rect,
@@ -2122,6 +2615,28 @@ impl Hooks for IpnMod {
             return Flow::Continue;
         }
         let mut st = self.state.lock().unwrap();
+        if let Some([grab_dx, grab_dy]) = st.dragging_search {
+            let bar_w = search_bar_width(event.screen.rect);
+            let [new_x, new_y] = clamp_bar_origin(
+                event.screen.mouse[0] - grab_dx,
+                event.screen.mouse[1] - grab_dy,
+                bar_w,
+                SEARCH_BAR_H,
+                st.last_screen_size,
+            );
+            st.persistent.search_offset = Some([
+                new_x - event.screen.rect[0],
+                new_y - event.screen.rect[1],
+            ]);
+            return Flow::Cancel;
+        }
+        if st
+            .search_widgets
+            .mouse_dragged(host, event.screen.mouse, event.button)
+            .handled()
+        {
+            return Flow::Cancel;
+        }
         let Some([grab_dx, grab_dy]) = st.dragging_panel else {
             return Flow::Continue;
         };
@@ -2131,20 +2646,13 @@ impl Hooks for IpnMod {
             .and_then(|m| m.slot_kinds(host))
             .is_some_and(|kinds| menu_has_storage(event.screen.menu, &kinds));
         let ph = panel_height(has_storage);
-        let sw = st.last_screen_size[0];
-        let sh = st.last_screen_size[1];
-        let mut new_x = event.screen.mouse[0] - grab_dx;
-        let mut new_y = event.screen.mouse[1] - grab_dy;
-        if sw > PANEL_W + 4.0 {
-            new_x = new_x.clamp(2.0, sw - PANEL_W - 2.0);
-        } else {
-            new_x = new_x.max(2.0);
-        }
-        if sh > ph + 4.0 {
-            new_y = new_y.clamp(2.0, sh - ph - 2.0);
-        } else {
-            new_y = new_y.max(2.0);
-        }
+        let [new_x, new_y] = clamp_bar_origin(
+            event.screen.mouse[0] - grab_dx,
+            event.screen.mouse[1] - grab_dy,
+            PANEL_W,
+            ph,
+            st.last_screen_size,
+        );
         st.persistent.custom_offset = Some([
             new_x - event.screen.rect[0],
             new_y - event.screen.rect[1],
@@ -2163,7 +2671,16 @@ impl Hooks for IpnMod {
         let mut st = self.state.lock().unwrap();
         if event.screen.id != "inventory" {
             st.dragging_panel = None;
+            st.dragging_search = None;
             return Flow::Continue;
+        }
+        if st.dragging_search.take().is_some() {
+            self.save_persistent(host, &st.persistent);
+            st.set_toast("Search bar position saved");
+            return Flow::Cancel;
+        }
+        if st.search_widgets.mouse_released(event.button).handled() {
+            return Flow::Cancel;
         }
         if st.dragging_panel.take().is_some() {
             self.save_persistent(host, &st.persistent);
@@ -2178,7 +2695,7 @@ impl Hooks for IpnMod {
         host: &dyn ClientHost,
         event: &mut ScreenKeyPressedPreEvent<'_>,
     ) -> Flow {
-        if event.screen.id != "inventory" || event.repeat {
+        if event.screen.id != "inventory" {
             return Flow::Continue;
         }
         let Some(player) = host.local_player() else {
@@ -2194,8 +2711,51 @@ impl Hooks for IpnMod {
             return Flow::Continue;
         };
 
-        let hovered = hovered_slot_kind(host, menu, event.screen.mouse);
         let settings = Self::read_settings(host);
+        {
+            let mut st = self.state.lock().unwrap();
+            self.ensure_loaded(host, &mut st);
+            st.cached_settings = settings;
+            if settings.show_search_bar && st.is_search_focused() {
+                if matches!(
+                    event.key,
+                    "key.keyboard.escape" | "key.keyboard.enter" | "key.keyboard.keypad.enter"
+                ) {
+                    st.search_widgets.set_focus(host, None);
+                    return Flow::Cancel;
+                }
+                if matches_mod_key(host, KEY_FOCUS_SEARCH, event.key, event.modifiers) {
+                    st.focus_search_select_all(host);
+                    return Flow::Cancel;
+                }
+                let _ = st
+                    .search_widgets
+                    .key_pressed(host, event.key, event.modifiers);
+                st.sync_search_suggestion();
+                if is_passthrough_nav_or_modifier_key(event.key) {
+                    return Flow::Continue;
+                }
+                return Flow::Cancel;
+            }
+            if !settings.show_search_bar && st.is_search_focused() {
+                st.search_widgets.set_focus(host, None);
+            }
+        }
+
+        if event.repeat {
+            return Flow::Continue;
+        }
+
+        if settings.show_search_bar
+            && matches_mod_key(host, KEY_FOCUS_SEARCH, event.key, event.modifiers)
+        {
+            let mut st = self.state.lock().unwrap();
+            self.ensure_loaded(host, &mut st);
+            st.focus_search_select_all(host);
+            return Flow::Cancel;
+        }
+
+        let hovered = hovered_slot_kind(host, menu, event.screen.mouse);
 
         if settings.prevent_locked_quickmove
             && let Some((_, MenuSlotKind::Player(ps))) = hovered
@@ -2359,6 +2919,35 @@ impl Hooks for IpnMod {
         }
 
         Flow::Continue
+    }
+
+    fn screen_char_typed_pre(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut ScreenCharTypedPreEvent<'_>,
+    ) -> Flow {
+        if event.screen.id != "inventory" {
+            return Flow::Continue;
+        }
+        if let Some(player) = host.local_player()
+            && (player.is_creative(host) == Some(true) || player.is_spectator(host) == Some(true))
+        {
+            return Flow::Continue;
+        }
+        let mut st = self.state.lock().unwrap();
+        self.ensure_loaded(host, &mut st);
+        if event.field.is_some() {
+            if st.is_search_focused() {
+                st.search_widgets.set_focus(host, None);
+            }
+            return Flow::Continue;
+        }
+        if !st.cached_settings.show_search_bar || !st.is_search_focused() {
+            return Flow::Continue;
+        }
+        let _ = st.search_widgets.char_typed(host, event.c);
+        st.sync_search_suggestion();
+        Flow::Cancel
     }
 
     fn input_key(&self, host: &mut dyn ClientHost, event: &mut InputKeyEvent<'_>) {

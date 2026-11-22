@@ -7,5 +7,5 @@ description = "Inventory sorting, locked slots, container transfers, auto-refill
 capabilities = ["registries"]
 
 [wasm]
-sha512 = "d39e86af097d0754ebd249e191ad1872731ccfe6422e3740b39d505a56e29ecd92f0736b63d89d644a49a654c73f107845ef7829355a3d2249a73d27a173fad2"
+sha512 = "1e0ad23a284558dd149315e0a41bd2f31bb443da83c6cf6980c322b20f3b5c660ef69f0395dcafcedf8ac346334db44aaadeed9b9811fce3507d99df664dc93b"
 toolchain = "1.99.1 58cf8f9c35b355199727627d07ae34a4e2846d67"
